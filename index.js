@@ -26,14 +26,18 @@ module.exports = function (compiledContractsSource) {
     output += 'module.exports = {\n';
 
     Promise.all(compiledContracts.map(function(compiledContract) {
-      return deploy(config, compiledContract, contractMap);
+      return deploy(config, compiledContract, contractMap)
+        .then(function(deployedContract) {
+          return [compiledContract.name, deployedContract];
+        })
+      ;
     })).then(function(deployedContracts) {
       var instances = [];
-      for (var deployedContract of deployedContracts) {
-        output += JSON.stringify(deployedContract.name) + ': ' + 'new web3.eth.Contract(';
-        output += JSON.stringify(deployedContract.abi) + ', ';
-        output += JSON.stringify(deployedContract.address) + '),\n';
-      }
+      deployedContracts.forEach(function([name, deployedContract]) {
+        output += JSON.stringify(name) + ': ' + 'new web3.eth.Contract(';
+        output += JSON.stringify(deployedContract.options.jsonInterface) + ', ';
+        output += JSON.stringify(deployedContract.options.address) + '),\n';
+      });
       output += 'web3: web3\n};\n';
       loaderCallback(null, output);
     }).catch(function(error) {
