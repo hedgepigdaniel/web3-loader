@@ -28,7 +28,8 @@ module.exports = function (compiledContractsSource) {
     Promise.all(compiledContracts.map(function(compiledContract) {
       return deploy(config, compiledContract, contractMap)
         .then(function(deployedContract) {
-          return [compiledContract.name, deployedContract];
+          var name = compiledContract.name.slice(compiledContract.name.indexOf(':') + 1);
+          return [name, deployedContract];
         })
       ;
     })).then(function(deployedContracts) {
