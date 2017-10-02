@@ -6,40 +6,40 @@ var path = require('path');
 var Graph = require("graphlib").Graph;
 var GraphAlgorithms = require("graphlib/lib/alg");
 
-var config;
+var configPromise;
 var web3;
 var isDebug;
 
 module.exports = function (compiledContractsSource) {
-  var loaderCallback = this.async();
-  this.cacheable && this.cacheable();
-  init(this);
+  var loader = this;
+  var loaderCallback = loader.async();
+  loader.cacheable && loader.cacheable();
+  init(loader);
+  configPromise.then(function(config) {
+    var contractMap = loader.exec(compiledContractsSource, '');
+    var compiledContracts = toArray(contractMap);
+    sortByDependencies(compiledContracts);
 
-  var contractMap = this.exec(compiledContractsSource, '');
-  var compiledContracts = toArray(contractMap);
-  sortByDependencies(compiledContracts);
+    var web3Source = fs.readFileSync(path.join(__dirname, '/lib/web3-helper.js'), 'utf8');
+    web3Source = web3Source.replace('__PROVIDER_URL__', config.provider);
+    var output = web3Source + '\n';
+    output += 'module.exports = {\n';
 
-  var web3Source = fs.readFileSync(path.join(__dirname, '/lib/web3-helper.js'), 'utf8');
-  web3Source = web3Source.replace('__PROVIDER_URL__', config.provider);
-  var output = web3Source + '\n';
-  output += 'module.exports = {\n';
-
-  async.mapSeries(
-    compiledContracts,
-    function (contract, callback) {
-      deploy(contract, callback, contractMap);
-    },
-    function (err, results) {
-      if (err) {
-        return loaderCallback(err);
-      }
+    Promise.all(compiledContracts.map(function(compiledContract) {
+      return deploy(config, compiledContract, contractMap);
+    })).then(function(deployedContracts) {
       var instances = [];
-      for (var result of results) {
-        output += JSON.stringify(result.name) + ': ' + 'web3.eth.contract(' + JSON.stringify(result.abi) + ').at(' + JSON.stringify(result.address) + '),\n';
+      for (var deployedContract of deployedContracts) {
+        output += JSON.stringify(deployedContract.name) + ': ' + 'new web3.eth.Contract(';
+        output += JSON.stringify(deployedContract.abi) + ', ';
+        output += JSON.stringify(deployedContract.address) + '),\n';
       }
       output += 'web3: web3\n};\n';
-      return loaderCallback(null, output);
+      loaderCallback(null, output);
+    }).catch(function(error) {
+      loaderCallback(error);
     });
+  });
 };
 
 /**
@@ -48,83 +48,82 @@ module.exports = function (compiledContractsSource) {
 function init(loader) {
   var loaderConfig = loaderUtils.getLoaderConfig(loader, 'web3Loader');
   web3 = require('./lib/web3')(loaderConfig.provider);
-  config = mergeConfig(loaderConfig);
   isDebug = loader.debug;
+  configPromise = mergeConfig(loaderConfig);
 }
 
 /**
  * Merge loaderConfig and default configurations
  */
 function mergeConfig(loaderConfig) {
-  var defaultConfig = {
-    // Web3
-    provider: 'http://localhost:8545',
+  return Promise.all([
+    web3.eth.getBlock(web3.eth.defaultBlock),
+    web3.eth.getAccounts(),
+  ])
+    .then(function([defaultBlock, accounts]) {
+      var defaultConfig = {
+        // Web3
+        provider: 'http://localhost:8545',
 
-    // For deployment
-    from: web3.eth.accounts[0],
-    gasLimit: web3.eth.getBlock(web3.eth.defaultBlock).gasLimit,
+        // For deployment
+        from: accounts[0],
+        gasLimit: defaultBlock.gasLimit,
 
-    // Specify contract constructor parameters, if any.
-    // constructorParams: {
-    //   ContractOne: [ 'param1_value', 'param2_value' ]
-    // }
-    constructorParams: {},
+        // Specify contract constructor parameters, if any.
+        // constructorParams: {
+        //   ContractOne: [ 'param1_value', 'param2_value' ]
+        // }
+        constructorParams: {},
 
-    // To use deployed contracts instead of redeploying, include contract addresses in config
-    // deployedContracts: {
-    //   ContractOne: '0x...........',
-    //   ContractTwo: '0x...........',
-    // }
-    deployedContracts: {}
-  };
+        // To use deployed contracts instead of redeploying, include contract addresses in config
+        // deployedContracts: {
+        //   ContractOne: '0x...........',
+        //   ContractTwo: '0x...........',
+        // }
+        deployedContracts: {}
+      };
 
-  var mergedConfig = loaderConfig;
-  for (var key in defaultConfig) {
-    if (!mergedConfig.hasOwnProperty(key)) {
-      mergedConfig[key] = defaultConfig[key];
-    }
-  }
-  return mergedConfig;
+      var mergedConfig = loaderConfig;
+      for (var key in defaultConfig) {
+        if (!mergedConfig.hasOwnProperty(key)) {
+          mergedConfig[key] = defaultConfig[key];
+        }
+      }
+      return mergedConfig
+    })
+  ;
 }
 
 /**
  * Deploy contracts, if it is not already deployed
  */
-function deploy(contract, callback, contractMap) {
+function deploy(config, contract, contractMap) {
   // Reuse existing contract address
   if (config.deployedContracts.hasOwnProperty(contract.name)) {
     contract.address = config.deployedContracts[contract.name];
-    return callback(null, contract);
+    return Promise.resolve(contract);
   }
 
   linkBytecode(contract, contractMap);
 
   // Deploy a new one
-  var params = resolveConstructorParams(contract, contractMap);
-  logDebug('Constructor params ' + contract.name + ':', params);
-  if(contract.bytecode && !contract.bytecode.startsWith('0x')) {
-    contract.bytecode = '0x' + contract.bytecode;
-  }
-  params.push({
+  var options = {
     from: config.from,
     data: contract.bytecode,
     gas: config.gasLimit,
-  });
-  params.push(function (err, deployed) {
-    if (err) {
-      return callback(err);
-    }
-    if (typeof deployed.address !== 'undefined') {
-      contract.address = deployed.address;
-      return callback(null, contract);
-    }
-  });
+  };
 
-  var web3Contract = web3.eth.contract(contract.abi);
-  web3Contract.new.apply(web3Contract, params);
+  var web3Contract = new web3.eth.Contract(contract.abi, undefined, options);
+  var params = resolveConstructorParams(config, contract, contractMap)
+  return web3Contract
+    .deploy({
+      arguments: params,
+    })
+    .send(options)
+  ;
 }
 
-function resolveConstructorParams(contract, contractMap) {
+function resolveConstructorParams(config, contract, contractMap) {
   var params = (config.constructorParams[contract.name] || []).slice();
   var injectableDependencies = getDependenciesFromConstructor(contract.abi);
   injectableDependencies.forEach(function (dep) {
